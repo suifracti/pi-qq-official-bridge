@@ -124,24 +124,30 @@ export class PiDeckAgentPool {
           : reason === "missing" || reason === "error"
             ? "原对话框不可用，请重新选择："
             : "尚未绑定对话框，请先选择（不会自动开跑）：";
-    const list = await this.listDialogs(key);
+    const list = await this.listDialogs(key, {
+      // 上下文已满时，不要把当前已满对话继续放进可选序号，避免用户回复 1 后死循环。
+      excludeCurrent: reason === "context_full",
+    });
     return `${why}\n\n${list}`;
   }
 
-  async listDialogs(key: string): Promise<string> {
+  async listDialogs(key: string, opts?: { excludeCurrent?: boolean }): Promise<string> {
     const state = await this.client.getState();
+    const current = this.bindings.bindings[key]?.agentId;
     const agents = state.agents
       .filter((a) => !a.projectId || a.projectId === this.projectId)
       .filter((a) => a.status !== "error")
+      .filter((a) => !(opts?.excludeCurrent && a.id === current))
       .slice()
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
-    const current = this.bindings.bindings[key]?.agentId;
     const ids = agents.map((a) => a.id);
     this.listCache.set(key, { at: Date.now(), ids });
 
     if (!agents.length) {
-      return "PiDeck 里还没有对话框。\n发送 /新会话 创建一个，或在桌面新建后再 /对话框。";
+      return opts?.excludeCurrent
+        ? "没有其它可选对话框。请发送 /新会话 创建新对话。"
+        : "PiDeck 里还没有对话框。\n发送 /新会话 创建一个，或在桌面新建后再 /对话框。";
     }
 
     const lines = ["请选择要使用的 PiDeck 对话框：", "回复序号即可，例如：1", "或：/对话框 1  /新会话", ""];
@@ -182,15 +188,14 @@ export class PiDeckAgentPool {
     if (!chosen && /^\d+$/.test(q)) {
       const n = Number(q);
       const cache = this.listCache.get(key);
-      // 缓存 10 分钟内有效；否则按当前列表
-      const ids =
-        cache && Date.now() - cache.at < 10 * 60 * 1000
-          ? cache.ids
-          : agents
-              .slice()
-              .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
-              .map((a) => a.id);
-      const id = ids[n - 1];
+      // 数字序号只能使用刚展示给 QQ 的列表缓存，避免缓存失效后按实时列表兜底选错对话。
+      if (!cache || Date.now() - cache.at >= 10 * 60 * 1000) {
+        return {
+          ok: false,
+          text: "选择缓存已过期。请先发送 /对话框 重新查看列表，再回复序号。",
+        };
+      }
+      const id = cache.ids[n - 1];
       if (!id) {
         return {
           ok: false,
