@@ -127,11 +127,9 @@ PiDeck 本体提供 Windows 安装包；本桥接与系统无关，只要本机 
 - 官方内置 **飞书** 桥，**无** QQ 官方机器人一等扩展市场/依附接口  
 - 本仓库独立维护，通过公开 Web API 对接，不修改 PiDeck 源码（可选增强除外）
 
-## 安全
+## 使用提醒
 
-- Pi/PiDeck 拥有本机 shell 权限，请设置 `bridge.allowOpenIds`  
-- 不要把 `config.json` 提交到公开仓库  
-- Web 服务建议只绑 `127.0.0.1`
+Pi/PiDeck 可执行本机命令；部署到群聊前，请在 `bridge.allowOpenIds` 中限制可使用机器人的账号。
 
 ## License
 
