@@ -56,24 +56,62 @@ export class QqApi {
     return this.sendMessage(target, payload);
   }
 
+  /**
+   * 发送文本。被动回复失败（次数/时间超限 40034128）时自动改为主动发送（不带 msg_id）。
+   * 返回已发送分段数，供调用方精确计算被动回复额度。
+   */
   async sendTextChunked(
     target: SendTarget,
     text: string,
-    opts: { msgId?: string; eventId?: string; maxChars?: number; startSeq?: number } = {},
-  ): Promise<number> {
+    opts: {
+      msgId?: string;
+      eventId?: string;
+      maxChars?: number;
+      startSeq?: number;
+      /** 强制主动（不带 msg_id） */
+      forceProactive?: boolean;
+    } = {},
+  ): Promise<{ nextSeq: number; usedProactive: boolean; passiveSent: number }> {
     const max = opts.maxChars ?? 1800;
     const chunks = splitText(text, max);
     let seq = opts.startSeq ?? randomSeq();
+    let usePassive = Boolean(opts.msgId) && !opts.forceProactive;
+    let usedProactive = !usePassive;
+    let passiveSent = 0;
+
     for (const chunk of chunks) {
-      await this.sendText(target, {
-        content: chunk,
-        msgId: opts.msgId,
-        eventId: opts.eventId,
-        msgSeq: seq++,
-      });
+      try {
+        await this.sendText(target, {
+          content: chunk,
+          msgId: usePassive ? opts.msgId : undefined,
+          eventId: usePassive ? opts.eventId : undefined,
+          msgSeq: seq++,
+        });
+        if (usePassive) passiveSent += 1;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const passiveLimited =
+          msg.includes("40034128") ||
+          msg.includes("被动回复时间或者次数超过限制") ||
+          msg.includes("被动回复");
+        if (usePassive && passiveLimited) {
+          console.warn("[qq-api] 被动回复超限，改为主动发送");
+          usePassive = false;
+          usedProactive = true;
+          await this.sendText(target, {
+            content: chunk,
+            msgSeq: seq++,
+          });
+        } else {
+          throw err;
+        }
+      }
       if (chunks.length > 1) await sleep(250);
     }
-    return seq;
+    console.log(
+      `[qq-api] sent chunks=${chunks.length} passive=${passiveSent} proactive=${usedProactive}`,
+    );
+    return { nextSeq: seq, usedProactive, passiveSent };
   }
 
   /**

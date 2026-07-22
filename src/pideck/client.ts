@@ -267,66 +267,89 @@ export class PiDeckClient {
       }
     };
 
-    while (true) {
-      if (options?.signal?.aborted) throw new Error("已取消");
-      if (Date.now() - started > timeoutMs) {
-        const msgs = await this.getMessages(agentId);
-        await pump(msgs, true);
-        const partial = extractAssistantReply(msgs, beforeCount, beforeLastAssistantId, beforeLastUserId);
-        // 若最终全文还有没流到的，返回剩余
-        return remainingFinal(partial, tracker.getEmittedTotal(), anyStreamed, tracker.getEmittedCompact());
-      }
+    const finish = async (reason: string) => {
+      const msgs = await this.getMessages(agentId);
+      await pump(msgs, true);
+      const partial = extractAssistantReply(msgs, beforeCount, beforeLastAssistantId, beforeLastUserId);
+      const rest = remainingFinal(
+        partial,
+        tracker.getEmittedTotal(),
+        anyStreamed,
+        tracker.getEmittedCompact(),
+      );
+      console.log(
+        `[pideck] prompt finish reason=${reason} streamed=${anyStreamed} rest_len=${rest.length}`,
+      );
+      return rest;
+    };
 
-      const state = await this.getState();
-      const agent = state.agents.find((a) => a.id === agentId);
-      if (!agent) throw new Error(`PiDeck agent 不存在: ${agentId}`);
-
-      options?.onStatus?.(agent.status);
-      if (agent.status === "running") {
-        sawRunning = true;
-        idleSince = null;
-      }
-      if (agent.status === "error") {
-        const msgs = state.messagesByAgent[agentId] ?? [];
-        const err = [...msgs].reverse().find((m) => m.role === "error");
-        throw new Error(err?.text || "PiDeck agent 进入 error 状态");
-      }
-
-      const msgs = state.messagesByAgent[agentId] ?? [];
-      await pump(msgs, false);
-
-      let tooling = false;
-      try {
-        const rt = await this.getRuntime(agentId);
-        tooling = Boolean(rt.isStreaming || rt.isCompacting || rt.isExecutingTool);
-      } catch {
-        tooling = false;
-      }
-
-      const idleLike =
-        agent.status === "idle" || agent.status === "ready" || agent.status === "done";
-
-      if (idleLike && !tooling) {
-        if (idleSince == null) idleSince = Date.now();
-        const idleFor = Date.now() - idleSince;
-        const quickDone = !sawRunning && Date.now() - started > 2500;
-        if (idleFor >= IDLE_MS || quickDone) {
-          await pump(msgs, true);
-          const reply = extractAssistantReply(
-            msgs,
-            beforeCount,
-            beforeLastAssistantId,
-            beforeLastUserId,
-          );
-          if (reply || sawRunning || anyStreamed || Date.now() - started > 2500) {
-            return remainingFinal(reply, tracker.getEmittedTotal(), anyStreamed, tracker.getEmittedCompact());
-          }
+    try {
+      while (true) {
+        if (options?.signal?.aborted) {
+          return await finish("aborted");
         }
-      } else {
-        idleSince = null;
-      }
+        if (Date.now() - started > timeoutMs) {
+          return await finish("timeout");
+        }
 
-      await sleep(pollIntervalMs, options?.signal);
+        const state = await this.getState();
+        const agent = state.agents.find((a) => a.id === agentId);
+        if (!agent) throw new Error(`PiDeck agent 不存在: ${agentId}`);
+
+        options?.onStatus?.(agent.status);
+        if (agent.status === "running") {
+          sawRunning = true;
+          idleSince = null;
+        }
+        if (agent.status === "error") {
+          const msgs = state.messagesByAgent[agentId] ?? [];
+          const err = [...msgs].reverse().find((m) => m.role === "error");
+          throw new Error(err?.text || "PiDeck agent 进入 error 状态");
+        }
+
+        const msgs = state.messagesByAgent[agentId] ?? [];
+        await pump(msgs, false);
+
+        let tooling = false;
+        try {
+          const rt = await this.getRuntime(agentId);
+          tooling = Boolean(rt.isStreaming || rt.isCompacting || rt.isExecutingTool);
+        } catch {
+          tooling = false;
+        }
+
+        const idleLike =
+          agent.status === "idle" || agent.status === "ready" || agent.status === "done";
+
+        if (idleLike && !tooling) {
+          if (idleSince == null) idleSince = Date.now();
+          const idleFor = Date.now() - idleSince;
+          const quickDone = !sawRunning && Date.now() - started > 2500;
+          if (idleFor >= IDLE_MS || quickDone) {
+            const rest = await finish(sawRunning ? "idle" : "idle-quick");
+            if (rest || anyStreamed || sawRunning || Date.now() - started > 2500) {
+              return rest;
+            }
+          }
+        } else {
+          idleSince = null;
+        }
+
+        try {
+          await sleep(pollIntervalMs, options?.signal);
+        } catch {
+          // sleep 被 abort 唤醒时必须走 finish，否则已生成正文不会 flush
+          if (options?.signal?.aborted) {
+            return await finish("aborted-sleep");
+          }
+          throw new Error("等待被中断");
+        }
+      }
+    } catch (err) {
+      if (options?.signal?.aborted) {
+        return await finish("aborted-catch");
+      }
+      throw err;
     }
   }
 
@@ -391,7 +414,8 @@ function remainingFinal(
   for (let i = 0; i + step <= fc.length; i += step) {
     if (ec.includes(fc.slice(i, i + step))) hit += step;
   }
-  if (fc.length > 0 && hit / fc.length >= 0.85) return "";
+  if (fc.length > 0 && hit / fc.length >= 0.92) return "";
+  // 中断/收尾：宁可补发完整最终段，也不要丢结论
   return final;
 }
 

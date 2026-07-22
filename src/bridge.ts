@@ -417,19 +417,17 @@ export class PiQqBridge {
     const clearedPending = this.pendingByKey.delete(sessionKey);
     const parts: string[] = [];
 
-    if (this.cfg.backend === "pideck" && this.deckPool && this.deckClient) {
-      const binding = this.deckPool.getBinding(sessionKey);
-      if (binding?.agentId) {
-        try {
-          await this.deckClient.stopAgent(binding.agentId);
-          parts.push(`已停止当前响应（${binding.agentId.slice(0, 8)}…）`);
-        } catch (err) {
-          parts.push(
-            `停止失败: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
+    if (this.cfg.backend === "pideck" && this.deckPool) {
+      // interrupt：abort 等待循环（强制 flush 已生成正文）+ stop agent
+      const r = await this.deckPool.interrupt(sessionKey);
+      if (r.agentId) {
+        parts.push(
+          r.aborted
+            ? `已中断，正在输出已生成内容（${r.agentId.slice(0, 8)}…）`
+            : `已请求停止（${r.agentId.slice(0, 8)}…）`,
+        );
       } else {
-        parts.push("当前未绑定对话框，无运行中的任务。");
+        parts.push("当前没有进行中的任务。");
       }
     } else {
       parts.push("SDK 后端暂不支持远程 /stop，请在进程侧中断。");
@@ -508,17 +506,18 @@ export class PiQqBridge {
     if (this.cfg.backend === "pideck" && this.deckPool) {
       let streamed = false;
       const sendTarget = target ?? toSendTarget(msg);
+      const coalescer = sendTarget ? this.createStreamCoalescer(sendTarget, msg) : null;
       const result = await this.deckPool.prompt(sessionKey, prompt, {
         pollIntervalMs: Math.min(this.cfg.pideck.pollIntervalMs, 500),
         timeoutMs: this.cfg.pideck.timeoutMs,
         displayName: msg.authorUsername || msg.authorOpenId.slice(0, 12),
         images: promptImages,
         streamPrefs: this.streamPrefs,
-        onStreamChunk: sendTarget
+        onStreamChunk: coalescer
           ? async (chunk) => {
               streamed = true;
               try {
-                await this.reply(sendTarget, msg, chunk.text);
+                await coalescer.push(chunk.text);
               } catch (err) {
                 console.warn(
                   `[bridge] stream reply failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -529,11 +528,20 @@ export class PiQqBridge {
       });
       if (!result.ok) return this.cfg.bridge.busyText;
       if (result.steered) return result.text;
+      // 收尾：刷出合并缓冲 + 最终补发段
+      if (coalescer) {
+        if (result.text && result.text.trim()) {
+          await coalescer.push(result.text);
+        }
+        await coalescer.flush(true);
+        console.log(
+          `[bridge] pideck agent=${result.agentId} streamed=${streamed} final_flush=1`,
+        );
+        return ""; // 已通过 coalescer 发出
+      }
       console.log(
         `[bridge] pideck agent=${result.agentId} reply_len=${result.text.length} streamed=${streamed}`,
       );
-      // 已流式输出则不再整包重发；若完全没流到字再回退整包
-      // result.text 为尚未流式发出的最终补发内容（可能为空）
       if (result.text && result.text.trim()) return result.text;
       if (streamed) return "";
       return "(空回复)";
@@ -560,57 +568,178 @@ export class PiQqBridge {
     return true;
   }
 
-  /** 原样转发 PiDeck 对话框回答：只剥 thinking / SEND_FILE，不加任何前缀包装 */
-  private async reply(target: SendTarget, msg: IncomingQqMessage, content: string): Promise<void> {
+  /** 每个用户消息的发送预算：QQ 被动回复次数有限 */
+  private readonly replyBudget = new Map<
+    string,
+    { seq: number; passiveLeft: number; forceProactive: boolean }
+  >();
+
+  private getBudget(msgId: string): { seq: number; passiveLeft: number; forceProactive: boolean } {
+    let b = this.replyBudget.get(msgId);
+    if (!b) {
+      b = {
+        seq: 1 + Math.floor(Math.random() * 1000),
+        // QQ 被动回复次数有限；按实际分段数递减，避免长文本误判额度。
+        passiveLeft: 3,
+        forceProactive: false,
+      };
+      this.replyBudget.set(msgId, b);
+    }
+    return b;
+  }
+
+  /** 原样转发：合并控制 + 被动超限自动改主动 */
+  private async reply(
+    target: SendTarget,
+    msg: IncomingQqMessage,
+    content: string,
+    opts?: { isFinal?: boolean },
+  ): Promise<void> {
     const { cleanText, files } = extractSendFiles(content);
     const cleaned = sanitizeReplyForQq(cleanText);
-
-    let seq = this.nextSeqByMsgId.get(msg.id) ?? 1 + Math.floor(Math.random() * 1000);
+    const budget = this.getBudget(msg.id);
 
     if (cleaned) {
-      seq = await this.api.sendTextChunked(target, cleaned, {
-        msgId: msg.id,
-        eventId: msg.eventId,
-        maxChars: this.cfg.bridge.maxReplyChars,
-        startSeq: seq,
-      });
+      const usePassive = !budget.forceProactive && budget.passiveLeft > 0;
+      try {
+        const r = await this.api.sendTextChunked(target, cleaned, {
+          msgId: usePassive ? msg.id : undefined,
+          eventId: usePassive ? msg.eventId : undefined,
+          maxChars: this.cfg.bridge.maxReplyChars,
+          startSeq: budget.seq,
+          forceProactive: !usePassive,
+        });
+        budget.seq = r.nextSeq;
+        if (r.usedProactive) {
+          budget.forceProactive = true;
+          budget.passiveLeft = 0;
+        } else if (usePassive) {
+          budget.passiveLeft = Math.max(0, budget.passiveLeft - r.passiveSent);
+          if (budget.passiveLeft === 0) budget.forceProactive = true;
+        }
+      } catch (err) {
+        console.warn(
+          `[bridge] reply failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
     for (const fp of files) {
       try {
         console.log(`[bridge] SEND_FILE -> ${fp}`);
-        seq = await this.api.sendLocalFile(target, fp, {
-          msgId: msg.id,
-          eventId: msg.eventId,
-          msgSeq: seq,
+        const usePassive = !budget.forceProactive && budget.passiveLeft > 0;
+        budget.seq = await this.api.sendLocalFile(target, fp, {
+          msgId: usePassive ? msg.id : undefined,
+          eventId: usePassive ? msg.eventId : undefined,
+          msgSeq: budget.seq,
         });
+        if (usePassive) {
+          budget.passiveLeft = Math.max(0, budget.passiveLeft - 1);
+          if (budget.passiveLeft === 0) budget.forceProactive = true;
+        }
         await sleep(300);
       } catch (err) {
         console.error(`[bridge] send file failed: ${fp}`, err);
         const errText = `发送文件失败: ${fp}\n${err instanceof Error ? err.message : String(err)}`;
-        seq = await this.api.sendTextChunked(target, errText.slice(0, this.cfg.bridge.maxReplyChars), {
-          msgId: msg.id,
-          eventId: msg.eventId,
-          maxChars: this.cfg.bridge.maxReplyChars,
-          startSeq: seq,
-        });
+        const r = await this.api.sendTextChunked(
+          target,
+          errText.slice(0, this.cfg.bridge.maxReplyChars),
+          {
+            msgId: budget.forceProactive ? undefined : msg.id,
+            eventId: budget.forceProactive ? undefined : msg.eventId,
+            maxChars: this.cfg.bridge.maxReplyChars,
+            startSeq: budget.seq,
+            forceProactive: budget.forceProactive,
+          },
+        );
+        budget.seq = r.nextSeq;
+        if (r.usedProactive) budget.forceProactive = true;
+        else budget.passiveLeft = Math.max(0, budget.passiveLeft - r.passiveSent);
       }
     }
 
-    if (!cleaned && files.length === 0) {
-      seq = await this.api.sendTextChunked(target, "(空回复)", {
-        msgId: msg.id,
-        eventId: msg.eventId,
+    if (!cleaned && files.length === 0 && opts?.isFinal) {
+      const r = await this.api.sendTextChunked(target, "(空回复)", {
+        msgId: budget.forceProactive ? undefined : msg.id,
+        eventId: budget.forceProactive ? undefined : msg.eventId,
         maxChars: this.cfg.bridge.maxReplyChars,
-        startSeq: seq,
+        startSeq: budget.seq,
+        forceProactive: budget.forceProactive,
       });
+      budget.seq = r.nextSeq;
     }
 
-    this.nextSeqByMsgId.set(msg.id, seq);
-    if (this.nextSeqByMsgId.size > 2000) {
-      const first = this.nextSeqByMsgId.keys().next().value;
-      if (first) this.nextSeqByMsgId.delete(first);
+    this.nextSeqByMsgId.set(msg.id, budget.seq);
+    this.replyBudget.set(msg.id, budget);
+    if (this.replyBudget.size > 2000) {
+      const first = this.replyBudget.keys().next().value;
+      if (first) this.replyBudget.delete(first);
     }
+  }
+
+  /**
+   * 流式合并器：避免每条气泡都打 QQ（被动回复次数会爆）。
+   * 中间过程最多刷几次；结束时整包刷剩余。
+   */
+  private createStreamCoalescer(
+    target: SendTarget,
+    msg: IncomingQqMessage,
+  ): {
+    push: (text: string) => Promise<void>;
+    flush: (isFinal?: boolean) => Promise<void>;
+  } {
+    let buf = "";
+    let midSends = 0;
+    const MAX_MID = 2; // 过程中最多 2 次合并发送
+    const MIN_CHARS = 80;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let chain: Promise<void> = Promise.resolve();
+
+    const doSend = async (text: string, isFinal: boolean) => {
+      const t = text.trim();
+      if (!t) return;
+      await this.reply(target, msg, t, { isFinal });
+    };
+
+    const flushNow = async (isFinal = false) => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      const out = buf;
+      buf = "";
+      if (!out.trim()) return;
+      if (!isFinal) {
+        if (midSends >= MAX_MID) {
+          // 超额：放回缓冲，留给 final 一次发完
+          buf = out;
+          return;
+        }
+        midSends += 1;
+      }
+      await doSend(out, isFinal);
+    };
+
+    return {
+      push: (text: string) => {
+        chain = chain.then(async () => {
+          buf = buf ? `${buf}\n\n${text}` : text;
+          // 已达过程发送上限：只缓冲
+          if (midSends >= MAX_MID) return;
+          if (buf.length >= MIN_CHARS && !timer) {
+            timer = setTimeout(() => {
+              timer = null;
+              chain = chain.then(() => flushNow(false));
+            }, 2500);
+          }
+        });
+        return chain;
+      },
+      flush: (isFinal = true) => {
+        chain = chain.then(() => flushNow(isFinal));
+        return chain;
+      },
+    };
   }
 }
 

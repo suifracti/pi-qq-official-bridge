@@ -78,6 +78,10 @@ const DEFAULT_POLICY: SessionPolicy = {
 export class PiDeckAgentPool {
   private readonly bindings: BindingStore;
   private readonly busy = new Set<string>();
+  /** sessionKey -> 当前运行的 AbortController */
+  private readonly activeRuns = new Map<string, AbortController>();
+  /** sessionKey -> agentId 当前运行 */
+  private readonly activeAgentByKey = new Map<string, string>();
   private readonly policy: SessionPolicy;
 
   constructor(
@@ -298,8 +302,11 @@ export class PiDeckAgentPool {
     }
 
     this.busy.add(key);
+    const ac = new AbortController();
+    this.activeRuns.set(key, ac);
     try {
       const { agentId, reason } = await this.ensureAgent(key, options?.displayName);
+      this.activeAgentByKey.set(key, agentId);
       // 若 agent 已在跑（例如桌面侧触发），也走引导
       const agent = await this.client.getAgent(agentId);
       if (agent?.status === "running") {
@@ -321,12 +328,40 @@ export class PiDeckAgentPool {
         images: options?.images,
         streamPrefs: options?.streamPrefs,
         onStreamChunk: options?.onStreamChunk,
+        signal: ac.signal,
       });
       this.touch(key, agentId);
       return { ok: true, text, agentId, reason };
     } finally {
       this.busy.delete(key);
+      this.activeRuns.delete(key);
+      this.activeAgentByKey.delete(key);
     }
+  }
+
+  /** 中断当前任务：abort 等待循环（会 flush 已生成正文）并 stop agent */
+  async interrupt(key: string): Promise<{ agentId?: string; aborted: boolean }> {
+    const ac = this.activeRuns.get(key);
+    const agentId = this.activeAgentByKey.get(key) || this.bindings.bindings[key]?.agentId;
+    let aborted = false;
+    // 1) 先 abort 等待循环 → finish() flush 已生成正文到 QQ
+    if (ac && !ac.signal.aborted) {
+      ac.abort();
+      aborted = true;
+      // 给 finish/pump 一点时间把剩余气泡推完
+      await new Promise((r) => setTimeout(r, 600));
+    }
+    // 2) 再 stop agent（若仍在跑）
+    if (agentId) {
+      try {
+        await this.client.stopAgent(agentId);
+      } catch {
+        // ignore
+      }
+      // stop 后再等一轮，让 idle 后的最终 assistant 气泡（若有）被原 wait 的 finish 吃到
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    return { agentId, aborted };
   }
 
   /** 用户显式要求新会话 */
