@@ -1,0 +1,60 @@
+{
+  "name": "pi-qq-official-bridge",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "description": "QQ Official Bot ↔ PiDeck bridge. Chat with your local Pi agent from QQ groups/C2C via PiDeck Web Service.",
+  "scripts": {
+    "login": "tsx src/login.ts",
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "enable-webservice": "node scripts/enable-pideck-webservice.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.10",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "pideck",
+    "qq",
+    "qqbot",
+    "bridge",
+    "extension",
+    "feishu-alternative"
+  ],
+  "pi": {
+    "extensions": [
+      "./.pi/extensions/qq/index.ts"
+    ]
+  },
+  "license": "MIT",
+  "author": "suifracti",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/suifracti/pi-qq-official-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/suifracti/pi-qq-official-bridge/issues"
+  },
+  "homepage": "https://github.com/suifracti/pi-qq-official-bridge#readme",
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ]
+}

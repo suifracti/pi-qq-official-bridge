@@ -1,0 +1,44 @@
+{
+  "appId": "你的 QQ 机器人 AppID（也可用 npm run login 扫码自动写入）",
+  "clientSecret": "你的 QQ 机器人 AppSecret",
+  "sandbox": false,
+  "backend": "pideck",
+  "intents": {
+    "publicMessages": true,
+    "publicGuildMessages": false,
+    "directMessage": false
+  },
+  "pideck": {
+    "baseUrl": "http://127.0.0.1:8765",
+    "projectId": "builtin-chat",
+    "bindingsPath": "sessions/pideck-bindings.json",
+    "pollIntervalMs": 500,
+    "timeoutMs": 600000,
+    "titlePrefix": "QQ",
+    "idleNewSessionMs": 43200000,
+    "contextFullPercent": 92
+  },
+  "pi": {
+    "cwd": ".",
+    "agentDir": "~/.pi/agent",
+    "sessionDir": "sessions"
+  },
+  "bridge": {
+    "allowOpenIds": [],
+    "allowGroupOpenIds": [],
+    "wakePrefix": "",
+    "ignoreBotMessages": true,
+    "maxReplyChars": 1800,
+    "busyText": "上一条还在处理，请稍后再发。",
+    "errorText": "处理失败，请稍后再试。",
+    "thinkingText": "收到，处理中…",
+    "sendThinkingAck": false,
+    "streamText": true,
+    "streamThinking": false,
+    "streamTools": false,
+    "commands": {
+      "newSession": ["/new", "/reset", "新会话"],
+      "help": ["/help", "帮助"]
+    }
+  }
+}
