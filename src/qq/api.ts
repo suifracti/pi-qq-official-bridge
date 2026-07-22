@@ -100,6 +100,8 @@ export class QqApi {
           usedProactive = true;
           await this.sendText(target, {
             content: chunk,
+            // 主动消息不带 msg_id；保留事件 ID，兼容群聊事件上下文。
+            eventId: opts.eventId,
             msgSeq: seq++,
           });
         } else {

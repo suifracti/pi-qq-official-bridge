@@ -678,8 +678,8 @@ export class PiQqBridge {
   }
 
   /**
-   * 流式合并器：避免每条气泡都打 QQ（被动回复次数会爆）。
-   * 中间过程最多刷几次；结束时整包刷剩余。
+   * 流式输出：StreamTracker 已保证传入的是稳定的完整助手气泡，收到即发。
+   * 被动回复额度耗尽后由 reply()/QQ API 自动切换主动发送，不能再为保护额度牺牲实时性。
    */
   private createStreamCoalescer(
     target: SendTarget,
@@ -688,11 +688,6 @@ export class PiQqBridge {
     push: (text: string) => Promise<void>;
     flush: (isFinal?: boolean) => Promise<void>;
   } {
-    let buf = "";
-    let midSends = 0;
-    const MAX_MID = 2; // 过程中最多 2 次合并发送
-    const MIN_CHARS = 80;
-    let timer: ReturnType<typeof setTimeout> | null = null;
     let chain: Promise<void> = Promise.resolve();
 
     const doSend = async (text: string, isFinal: boolean) => {
@@ -701,44 +696,13 @@ export class PiQqBridge {
       await this.reply(target, msg, t, { isFinal });
     };
 
-    const flushNow = async (isFinal = false) => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      const out = buf;
-      buf = "";
-      if (!out.trim()) return;
-      if (!isFinal) {
-        if (midSends >= MAX_MID) {
-          // 超额：放回缓冲，留给 final 一次发完
-          buf = out;
-          return;
-        }
-        midSends += 1;
-      }
-      await doSend(out, isFinal);
-    };
-
     return {
       push: (text: string) => {
-        chain = chain.then(async () => {
-          buf = buf ? `${buf}\n\n${text}` : text;
-          // 已达过程发送上限：只缓冲
-          if (midSends >= MAX_MID) return;
-          if (buf.length >= MIN_CHARS && !timer) {
-            timer = setTimeout(() => {
-              timer = null;
-              chain = chain.then(() => flushNow(false));
-            }, 2500);
-          }
-        });
+        // 每个稳定气泡立即投递，恢复原先实时流式体验。
+        chain = chain.then(() => doSend(text, false));
         return chain;
       },
-      flush: (isFinal = true) => {
-        chain = chain.then(() => flushNow(isFinal));
-        return chain;
-      },
+      flush: (_isFinal = true) => chain,
     };
   }
 }
